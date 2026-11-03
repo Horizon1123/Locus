@@ -1,0 +1,117 @@
+diff --git a/Locus/Engine/LocationEngine.swift b/Locus/Engine/LocationEngine.swift
+index cf49f82..9a2be96 100644
+--- a/Locus/Engine/LocationEngine.swift
++++ b/Locus/Engine/LocationEngine.swift
+@@ -16,7 +16,7 @@ enum LocationEngineError: LocalizedError {
+         switch self {
+         case .invalidIP: return "Tunnel IP is invalid. Check Settings → Tunnel IP (usually 10.7.0.1)."
+         case .pairingRead: return "Could not read the RPPairing file. Generate one with idevice_pair in RPPairing mode."
+-        case .tunnelCreate: return "Could not open the developer tunnel. Is LocalDevVPN connected on Wi‑Fi?"
++        case .tunnelCreate: return "Could not reach the developer tunnel. Check LocalDevVPN and the tunnel address in Settings."
+         case .remoteServer: return "Connected to the tunnel but RemoteXPC handshake failed."
+         case .simulationCreate: return "Could not open Apple’s location simulation service."
+         case .locationSet: return "Failed to set simulated coordinates."
+diff --git a/Locus/Engine/SpoofSession.swift b/Locus/Engine/SpoofSession.swift
+index 2ce022f..ec0a5ec 100644
+--- a/Locus/Engine/SpoofSession.swift
++++ b/Locus/Engine/SpoofSession.swift
+@@ -109,6 +109,7 @@ final class SpoofSession: ObservableObject {
+     @Published var travelMode: TravelMode = .walk
+     @Published var mapStyleIndex: Int = 0
+     @Published var lastError: String?
++    @Published private(set) var reconnectError: String?
+     @Published var isBusy = false
+     @Published var joystickActive = false
+     @Published private(set) var lastSuccessfulWriteAt: Date?
+@@ -216,6 +217,7 @@ final class SpoofSession: ObservableObject {
+         successfulWriteCount = 0
+         activePairing = nil
+         status = .idle
++        reconnectError = nil
+         clearPersistedSpoof()
+         audioKeepAlive.stop()
+         // Clear on the engine queue even if a reconnect is still opening its
+@@ -588,6 +590,7 @@ final class SpoofSession: ObservableObject {
+         let generation = sessionGeneration
+         // .reconnecting (rather than .connecting) so the Stop button is available.
+         status = .reconnecting
++        reconnectError = nil
+         reconnectTask = Task { [weak self] in
+             var attempt = 0
+             while !Task.isCancelled {
+@@ -606,7 +609,10 @@ final class SpoofSession: ObservableObject {
+                     self.finishReconnect(at: target, pairing: pairing)
+                     return
+                 case .failure(let error):
+-                    self.lastError = error.localizedDescription
++                    // Automatic retries must not reopen a blocking alert every
++                    // time the user dismisses it. Keep the failure visible in
++                    // the status bar while retrying the saved target.
++                    self.reconnectError = error.localizedDescription
+                     attempt += 1
+                     NSLog("[Locus] reconnect attempt %d failed: %@", attempt, String(describing: error))
+                     if attempt == 3 {
+@@ -628,6 +634,7 @@ final class SpoofSession: ObservableObject {
+         pin = coordinate
+         status = .active
+         lastError = nil
++        reconnectError = nil
+         beginBackground()
+         locationKeeper.start()
+         audioKeepAlive.start()
+diff --git a/Locus/Features/Map/RootView.swift b/Locus/Features/Map/RootView.swift
+index c417483..636857e 100644
+--- a/Locus/Features/Map/RootView.swift
++++ b/Locus/Features/Map/RootView.swift
+@@ -137,6 +137,12 @@ struct StatusBarView: View {
+                 Text(title)
+                     .font(.subheadline.weight(.semibold))
+                     .foregroundStyle(.primary)
++                if let error = session.reconnectError, case .reconnecting = session.status {
++                    Text(error)
++                        .font(.caption2)
++                        .foregroundStyle(LocusTheme.statusWarn)
++                        .fixedSize(horizontal: false, vertical: true)
++                }
+                 if let lastWrite = session.lastSuccessfulWriteAt {
+                     Text("Written \(lastWrite.formatted(date: .omitted, time: .standard)) · \(session.successfulWriteCount)")
+                         .font(.caption2.monospacedDigit())
+diff --git a/Locus/Features/Settings/SettingsView.swift b/Locus/Features/Settings/SettingsView.swift
+index b7af2d0..f6e519f 100644
+--- a/Locus/Features/Settings/SettingsView.swift
++++ b/Locus/Features/Settings/SettingsView.swift
+@@ -100,7 +100,7 @@ struct SettingsView: View {
+                 } header: {
+                     Text("Tunnel")
+                 } footer: {
+-                    Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward.")
++                    Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Cellular availability depends on the device's tunnel routing. A saved target cannot be written while the developer tunnel is unreachable.")
+                 }
+ 
+                 Section("Privacy") {
+diff --git a/README.md b/README.md
+index a9b4447..b13bf3c 100644
+--- a/README.md
++++ b/README.md
+@@ -44,7 +44,11 @@ Locus uses the MIT-licensed [idevice](https://github.com/jkcoxson/idevice) FFI t
+ 
+ Also install **[LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044)** (loopback tunnel, default `10.7.0.1`), then sideload Locus.
+ 
+-Start a teleport on Wi‑Fi first; the session can keep working on cellular afterward.
++The developer tunnel must remain reachable for continued writes. Starting on
++Wi‑Fi does not guarantee continuity on cellular. On the tested iPhone 13 with
++iOS 18.1.1 and LocalDevVPN 1.3.0, both `10.7.0.1` and `127.0.0.1` failed after
++Wi‑Fi was disabled. The last coordinate remains cached, but cannot be written
++to the system until a working tunnel is available.
+ 
+ The native location and tunnel operations have deadlines, so a silent peer
+ returns an error and the last target can be retried on a fresh connection.
+@@ -54,6 +58,8 @@ While active, Locus re-sends the selected coordinates every 2 seconds and first
+ reuses the existing developer session when the network changes. A failed write
+ retries after 1 second, then every 2 seconds; requests never overlap. These are
+ scheduling intervals, and a slow tunnel call can take longer.
++Automatic connection failures appear in the status bar instead of repeatedly
++opening an alert. Reconnecting does not mean a coordinate was successfully written.
+ 
+ The status bar shows the last successful location-service write and its count.
+ To check Wi‑Fi-to-cellular continuity, establish a teleport on Wi‑Fi, leave
