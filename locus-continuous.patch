@@ -1,0 +1,736 @@
+diff --git a/Locus/Engine/DeviceTunnel.swift b/Locus/Engine/DeviceTunnel.swift
+index 954e467..cc6ebae 100644
+--- a/Locus/Engine/DeviceTunnel.swift
++++ b/Locus/Engine/DeviceTunnel.swift
+@@ -4,6 +4,26 @@ enum TunnelConfig {
+     /// LocalDevVPN / SideStore-style loopback tunnel endpoint.
+     static let defaultIP = "10.7.0.1"
+     static let defaultsKey = "locus.targetDeviceIP"
++    static let portKey = "locus.remotePairingPortOverride"
++
++    static var targetPort: UInt16 {
++        if let value = UserDefaults.standard.string(forKey: portKey),
++           let port = UInt16(value.trimmingCharacters(in: .whitespacesAndNewlines)), port > 0 {
++            return port
++        }
++        if let port = Bundle.main.object(forInfoDictionaryKey: "LocusTunnelPort") as? Int,
++           (1...65535).contains(port) {
++            return UInt16(port)
++        }
++        return 49152
++    }
++
++    @discardableResult
++    static func setTargetPort(_ value: String) -> Bool {
++        guard let port = UInt16(value.trimmingCharacters(in: .whitespacesAndNewlines)), port > 0 else { return false }
++        UserDefaults.standard.set(String(port), forKey: portKey)
++        return true
++    }
+ 
+     static var targetIP: String {
+         let stored = UserDefaults.standard.string(forKey: defaultsKey)?
+diff --git a/Locus/Engine/LocationEngine.swift b/Locus/Engine/LocationEngine.swift
+index 9c7bcfe..b1245d2 100644
+--- a/Locus/Engine/LocationEngine.swift
++++ b/Locus/Engine/LocationEngine.swift
+@@ -10,6 +10,7 @@ enum LocationEngineError: LocalizedError {
+     case locationSet
+     case locationClear
+     case notActive
++    case cancelled
+ 
+     var errorDescription: String? {
+         switch self {
+@@ -21,6 +22,7 @@ enum LocationEngineError: LocalizedError {
+         case .locationSet: return "Failed to set simulated coordinates."
+         case .locationClear: return "Failed to clear simulated location."
+         case .notActive: return "No active simulation session."
++        case .cancelled: return "Location update cancelled."
+         }
+     }
+ 
+@@ -41,6 +43,25 @@ enum LocationEngineError: LocalizedError {
+ /// Thin Swift wrapper around idevice’s DVT location simulation (injects into locationd).
+ enum LocationEngine {
+     private static let queue = DispatchQueue(label: "com.chrismack.locus.location", qos: .userInitiated)
++    private static let sessionStateLock = NSLock()
++    private static var sessionActive = false
++
++    private final class PendingRequest: @unchecked Sendable {
++        private let lock = NSLock()
++        private var cancelled = false
++
++        func cancel() {
++            lock.lock()
++            cancelled = true
++            lock.unlock()
++        }
++
++        var isCancelled: Bool {
++            lock.lock()
++            defer { lock.unlock() }
++            return cancelled
++        }
++    }
+ 
+     private static var adapter: OpaquePointer?
+     private static var handshake: OpaquePointer?
+@@ -56,7 +77,46 @@ enum LocationEngine {
+     private static let locationSet: Int32 = 11
+     private static let locationClear: Int32 = 12
+ 
+-    static var isSessionActive: Bool { locationSimulation != nil }
++    static var isSessionActive: Bool {
++        sessionStateLock.lock()
++        defer { sessionStateLock.unlock() }
++        return sessionActive
++    }
++
++    private static func updateSessionState(_ active: Bool) {
++        sessionStateLock.lock()
++        sessionActive = active
++        sessionStateLock.unlock()
++    }
++
++    /// Enqueue before suspending, so a subsequent clear is always ordered after
++    /// this request. Cancelling also prevents queued requests from opening a tunnel.
++    static func setAsync(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) async -> Result<Void, LocationEngineError> {
++        let request = PendingRequest()
++        return await withTaskCancellationHandler {
++            await withCheckedContinuation { continuation in
++                queue.async {
++                    guard !request.isCancelled else {
++                        continuation.resume(returning: .failure(.cancelled))
++                        return
++                    }
++                    let code = setLocked(latitude: latitude, longitude: longitude, pairingPath: pairingPath, deviceIP: deviceIP)
++                    continuation.resume(returning: code == ok ? .success(()) : .failure(.from(code: code)))
++                }
++            }
++        } onCancel: {
++            request.cancel()
++        }
++    }
++
++    static func clearAsync() async -> Result<Void, LocationEngineError> {
++        await withCheckedContinuation { continuation in
++            queue.async {
++                let code = clearLocked()
++                continuation.resume(returning: code == ok ? .success(()) : .failure(.from(code: code)))
++            }
++        }
++    }
+ 
+     static func set(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) -> Result<Void, LocationEngineError> {
+         var result: Result<Void, LocationEngineError> = .failure(.locationSet)
+@@ -77,6 +137,7 @@ enum LocationEngine {
+     }
+ 
+     private static func cleanup() {
++        updateSessionState(false)
+         if let locationSimulation {
+             location_simulation_free(locationSimulation)
+             self.locationSimulation = nil
+@@ -107,7 +168,7 @@ enum LocationEngine {
+ 
+         var address = sockaddr_in()
+         address.sin_family = sa_family_t(AF_INET)
+-        address.sin_port = in_port_t(49152).bigEndian
++        address.sin_port = in_port_t(TunnelConfig.targetPort).bigEndian
+         let inetResult = deviceIP.withCString { inet_pton(AF_INET, $0, &address.sin_addr) }
+         guard inetResult == 1 else { return invalidIP }
+ 
+@@ -158,11 +219,12 @@ enum LocationEngine {
+             cleanup()
+             return locationSet
+         }
++        updateSessionState(true)
+         return ok
+     }
+ 
+     private static func clearLocked() -> Int32 {
+-        guard let locationSimulation else { return locationClear }
++        guard let locationSimulation else { return ok }
+         let err = location_simulation_clear(locationSimulation)
+         cleanup()
+         if let err {
+diff --git a/Locus/Engine/SpoofSession.swift b/Locus/Engine/SpoofSession.swift
+index 1e362a9..0434f73 100644
+--- a/Locus/Engine/SpoofSession.swift
++++ b/Locus/Engine/SpoofSession.swift
+@@ -1,6 +1,9 @@
++import Combine
+ import CoreLocation
+ import Foundation
+ import MapKit
++import Network
++import NetworkExtension
+ import UIKit
+ import UserNotifications
+ 
+@@ -68,6 +71,36 @@ enum SpoofStatus: Equatable {
+     }
+ }
+ 
++/// Fires `onChange` whenever the set of usable network interfaces changes
++/// (Wi‑Fi ↔ cellular, Wi‑Fi lost, a VPN toggled…). The first callback after
++/// `start()` only records the baseline and is not reported.
++final class NetworkWatcher: @unchecked Sendable {
++    private let monitor = NWPathMonitor()
++    private let queue = DispatchQueue(label: "com.chrismack.locus.netwatch")
++    private var lastSignature: String?
++    var onChange: (@Sendable (String) -> Void)?
++
++    func start() {
++        monitor.pathUpdateHandler = { [weak self] path in
++            guard let self else { return }
++            let types: [NWInterface.InterfaceType] = [.wifi, .cellular, .wiredEthernet, .other]
++            let used = types.filter { path.usesInterfaceType($0) }.map { "\($0)" }.joined(separator: "+")
++            let names = path.availableInterfaces.map { $0.name }.sorted().joined(separator: ",")
++            let signature = "\(path.status) [\(used)] {\(names)}"
++            if signature == self.lastSignature { return }
++            let isBaseline = self.lastSignature == nil
++            self.lastSignature = signature
++            if isBaseline { return }
++            self.onChange?(signature)
++        }
++        monitor.start(queue: queue)
++    }
++
++    deinit {
++        monitor.cancel()
++    }
++}
++
+ @MainActor
+ final class SpoofSession: ObservableObject {
+     @Published var status: SpoofStatus = .idle
+@@ -78,6 +111,8 @@ final class SpoofSession: ObservableObject {
+     @Published var lastError: String?
+     @Published var isBusy = false
+     @Published var joystickActive = false
++    @Published private(set) var lastSuccessfulWriteAt: Date?
++    @Published private(set) var successfulWriteCount = 0
+ 
+     @Published var favorites: [SavedPlace] = []
+     @Published var recents: [SavedPlace] = []
+@@ -89,13 +124,44 @@ final class SpoofSession: ObservableObject {
+     private var backgroundTask = UIBackgroundTaskIdentifier.invalid
+     private var joystickVector: CGVector = .zero
+     private let locationKeeper = BackgroundKeepAlive()
++    private let audioKeepAlive = SilentAudioKeepAlive()
++    private let netWatcher = NetworkWatcher()
++    private var reconnectTask: Task<Void, Never>?
++    private var resendTask: Task<Void, Never>?
++    private var sessionGeneration = UUID()
++    private var coordinateRevision = 0
++    private var isStopping = false
++    private var vpnObserver: NSObjectProtocol?
++    private weak var activePairing: PairingStore?
++    private var lastPersist = Date.distantPast
++    private static let writeInterval: TimeInterval = 2
+ 
+     private let favoritesKey = "locus.favorites"
+     private let recentsKey = "locus.recents"
++    private let persistKey = "locus.lastSpoof"
+ 
+     init() {
+         favorites = SavedPlace.load(key: favoritesKey)
+         recents = SavedPlace.load(key: recentsKey)
++
++        // Wi‑Fi ↔ cellular switches (or a VPN toggle) can kill the developer
++        // session even though LocalDevVPN still looks connected. Re-establish it
++        // immediately instead of waiting for the next timer tick.
++        netWatcher.onChange = { [weak self] signature in
++            Task { @MainActor in
++                self?.handleNetworkChange("network changed: \(signature)")
++            }
++        }
++        netWatcher.start()
++        vpnObserver = NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange, object: nil, queue: .main) { [weak self] _ in
++            Task { @MainActor in
++                self?.handleNetworkChange("vpn status changed")
++            }
++        }
++    }
++
++    deinit {
++        if let vpnObserver { NotificationCenter.default.removeObserver(vpnObserver) }
+     }
+ 
+     var isSpoofing: Bool {
+@@ -105,6 +171,7 @@ final class SpoofSession: ObservableObject {
+     }
+ 
+     func teleport(to coordinate: CLLocationCoordinate2D, pairing: PairingStore) {
++        guard !isStopping else { return }
+         guard pairing.hasPairingFile else {
+             lastError = "Import an RPPairing file in Settings first."
+             return
+@@ -114,26 +181,40 @@ final class SpoofSession: ObservableObject {
+     }
+ 
+     func stop(pairing: PairingStore) {
++        guard !isStopping else { return }
++        isStopping = true
++        sessionGeneration = UUID()
++        reconnectTask?.cancel()
++        reconnectTask = nil
+         routeTask?.cancel()
+         routeTask = nil
+         stopJoystick()
+         stopResend()
+         stopHealth()
+         isBusy = true
+-        let result = LocationEngine.clear()
+-        isBusy = false
+-        switch result {
+-        case .success:
+-            simulated = nil
+-            status = .idle
++        simulated = nil
++        lastSuccessfulWriteAt = nil
++        successfulWriteCount = 0
++        activePairing = nil
++        status = .idle
++        clearPersistedSpoof()
++        audioKeepAlive.stop()
++        // Clear on the engine queue even if a reconnect is still opening its
++        // tunnel. Cancellation cannot interrupt a native call already in progress.
++        Task {
++            let result = await LocationEngine.clearAsync()
++            isBusy = false
++            isStopping = false
+             endBackground()
+-            // Keep location updates running so the map puck / locate button
+-            // can return to the real GPS fix (not the leftover pin).
+             locationKeeper.start()
+-        case .failure(let error):
+-            lastError = error.localizedDescription
+-            status = .dropped(error.localizedDescription)
+-            postDropNotification(error.localizedDescription)
++            switch result {
++            case .success:
++                lastError = nil
++            case .failure(let error):
++                lastError = error.localizedDescription
++                status = .dropped(error.localizedDescription)
++                postDropNotification(error.localizedDescription)
++            }
+         }
+     }
+ 
+@@ -148,6 +229,7 @@ final class SpoofSession: ObservableObject {
+     }
+ 
+     func startJoystick(pairing: PairingStore) {
++        guard !isStopping else { return }
+         guard pairing.hasPairingFile else {
+             lastError = "Import an RPPairing file in Settings first."
+             return
+@@ -181,14 +263,15 @@ final class SpoofSession: ObservableObject {
+     }
+ 
+     func followRoute(_ coordinates: [CLLocationCoordinate2D], pairing: PairingStore) {
+-        guard pairing.hasPairingFile, coordinates.count >= 2 else { return }
++        guard !isStopping, pairing.hasPairingFile, coordinates.count >= 2 else { return }
+         routeTask?.cancel()
+         stopJoystick()
+         let mode = travelMode
+         routeTask = Task { [weak self] in
+-            guard let self else { return }
++            guard let self, !Task.isCancelled else { return }
+             var previous = coordinates[0]
+             await MainActor.run {
++                guard !Task.isCancelled else { return }
+                 self.apply(previous, pairing: pairing, markRecent: true)
+             }
+             for next in coordinates.dropFirst() {
+@@ -208,7 +291,9 @@ final class SpoofSession: ObservableObject {
+                     )
+                     let delay = stepMeters / speed
+                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
++                    guard !Task.isCancelled else { return }
+                     await MainActor.run {
++                        guard !Task.isCancelled else { return }
+                         self.apply(coord, pairing: pairing, markRecent: false)
+                     }
+                 }
+@@ -288,6 +373,17 @@ final class SpoofSession: ObservableObject {
+     }
+ 
+     private func apply(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool) {
++        guard !isStopping else { return }
++        coordinateRevision += 1
++        activePairing = pairing
++        // A reconnect loop owns the tunnel right now. Retarget it instead of blocking
++        // the main thread on a network call that is likely to fail.
++        if reconnectTask != nil {
++            simulated = coordinate
++            pin = coordinate
++            if markRecent { pushRecent(coordinate) }
++            return
++        }
+         if status == .idle || status.isDropped {
+             status = .connecting
+         }
+@@ -301,22 +397,27 @@ final class SpoofSession: ObservableObject {
+         isBusy = false
+         switch result {
+         case .success:
++            recordSuccessfulWrite()
+             simulated = coordinate
+             pin = coordinate
+             status = .active
+             lastError = nil
+             beginBackground()
+             locationKeeper.start()
++            audioKeepAlive.start()
+             startResend(pairing: pairing)
+             startHealth(pairing: pairing)
++            persistSpoof(coordinate)
+             if markRecent {
+                 pushRecent(coordinate)
+             }
+         case .failure(let error):
+             lastError = error.localizedDescription
++            NSLog("[Locus] apply failed: %@", String(describing: error))
+             if simulated != nil {
++                simulated = coordinate
+                 status = .dropped(error.localizedDescription)
+-                postDropNotification(error.localizedDescription)
++                startReconnect(to: coordinate, pairing: pairing, reason: "apply failed: \(error)")
+             } else {
+                 status = .idle
+             }
+@@ -324,7 +425,7 @@ final class SpoofSession: ObservableObject {
+     }
+ 
+     private func tickJoystick(pairing: PairingStore) {
+-        guard joystickActive, let current = simulated else { return }
++        guard joystickActive, reconnectTask == nil, let current = simulated else { return }
+         let magnitude = hypot(joystickVector.dx, joystickVector.dy)
+         guard magnitude > 0.08 else { return }
+         let nx = joystickVector.dx / magnitude
+@@ -338,20 +439,33 @@ final class SpoofSession: ObservableObject {
+ 
+     private func startResend(pairing: PairingStore) {
+         resendTimer?.invalidate()
+-        resendTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
+-            Task { @MainActor in
+-                guard let self, let sim = self.simulated else { return }
+-                _ = LocationEngine.set(
+-                    latitude: sim.latitude,
+-                    longitude: sim.longitude,
+-                    pairingPath: pairing.pairingPath,
+-                    deviceIP: TunnelConfig.targetIP
+-                )
++        let timer = Timer(timeInterval: Self.writeInterval, repeats: true) { [weak self] _ in
++            Task { @MainActor [weak self] in
++                guard let self, !self.isStopping, self.reconnectTask == nil,
++                      self.resendTask == nil, let sim = self.simulated else { return }
++                let generation = self.sessionGeneration
++                let revision = self.coordinateRevision
++                self.resendTask = Task { [weak self] in
++                    guard let self else { return }
++                    let result = await self.setOffMain(sim, pairing: pairing)
++                    guard !Task.isCancelled, self.sessionGeneration == generation else { return }
++                    self.resendTask = nil
++                    if case .failure(let error) = result, self.coordinateRevision == revision,
++                       self.reconnectTask == nil, let current = self.simulated {
++                        NSLog("[Locus] periodic resend failed: %@", String(describing: error))
++                        self.startReconnect(to: current, pairing: pairing, reason: "resend failed: \(error)")
++                    }
++                }
+             }
+         }
++        // Keep the writer scheduled while the user pans the map or drags controls.
++        RunLoop.main.add(timer, forMode: .common)
++        resendTimer = timer
+     }
+ 
+     private func stopResend() {
++        resendTask?.cancel()
++        resendTask = nil
+         resendTimer?.invalidate()
+         resendTimer = nil
+     }
+@@ -360,13 +474,9 @@ final class SpoofSession: ObservableObject {
+         healthTimer?.invalidate()
+         healthTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
+             Task { @MainActor in
+-                guard let self, let sim = self.simulated else { return }
+-                if case .dropped = self.status {
+-                    self.status = .reconnecting
+-                    self.apply(sim, pairing: pairing, markRecent: false)
+-                } else if !LocationEngine.isSessionActive, self.isSpoofing {
+-                    self.status = .reconnecting
+-                    self.apply(sim, pairing: pairing, markRecent: false)
++                guard let self, self.reconnectTask == nil, let sim = self.simulated else { return }
++                if self.status.isDropped || (self.isSpoofing && !LocationEngine.isSessionActive) {
++                    self.startReconnect(to: sim, pairing: pairing, reason: "health check")
+                 }
+             }
+         }
+@@ -377,6 +487,160 @@ final class SpoofSession: ObservableObject {
+         healthTimer = nil
+     }
+ 
++    // MARK: - Reconnect & persistence
++
++    private struct PersistedSpoof: Codable {
++        var latitude: Double
++        var longitude: Double
++        var bootTime: TimeInterval
++    }
++
++    private static func bootTime() -> TimeInterval? {
++        var tv = timeval()
++        var size = MemoryLayout<timeval>.stride
++        var mib: [Int32] = [CTL_KERN, KERN_BOOTTIME]
++        guard sysctl(&mib, 2, &tv, &size, nil, 0) == 0, tv.tv_sec > 0 else { return nil }
++        return TimeInterval(tv.tv_sec)
++    }
++
++    /// Remember the last teleport so it can be restored after the app is killed.
++    /// Throttled so the joystick (4 updates/s) doesn't hammer UserDefaults.
++    private func persistSpoof(_ coordinate: CLLocationCoordinate2D, force: Bool = false) {
++        let now = Date()
++        guard force || now.timeIntervalSince(lastPersist) > 2,
++              let bootTime = Self.bootTime() else { return }
++        lastPersist = now
++        let value = PersistedSpoof(
++            latitude: coordinate.latitude,
++            longitude: coordinate.longitude,
++            bootTime: bootTime
++        )
++        if let data = try? JSONEncoder().encode(value) {
++            UserDefaults.standard.set(data, forKey: persistKey)
++        }
++    }
++
++    private func clearPersistedSpoof() {
++        UserDefaults.standard.removeObject(forKey: persistKey)
++        lastPersist = .distantPast
++    }
++
++    /// Call on launch. Re-applies the last teleport after the app was killed or
++    /// relaunched, but not after a phone reboot (iOS has dropped the override by then).
++    func resumeIfNeeded(pairing: PairingStore) {
++        activePairing = pairing
++        guard !isStopping, status == .idle, reconnectTask == nil, pairing.hasPairingFile,
++              let data = UserDefaults.standard.data(forKey: persistKey),
++              let saved = try? JSONDecoder().decode(PersistedSpoof.self, from: data) else { return }
++        guard let bootTime = Self.bootTime(), saved.bootTime == bootTime,
++              CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: saved.latitude, longitude: saved.longitude)) else {
++            clearPersistedSpoof()
++            return
++        }
++        let coordinate = CLLocationCoordinate2D(latitude: saved.latitude, longitude: saved.longitude)
++        pin = coordinate
++        simulated = coordinate
++        startReconnect(to: coordinate, pairing: pairing, reason: "resume after relaunch")
++    }
++
++    /// Call when the app returns to the foreground: if we should be spoofing but the
++    /// session is gone, bring it back.
++    func reconnectIfNeeded(pairing: PairingStore) {
++        activePairing = pairing
++        guard !isStopping, reconnectTask == nil, let sim = simulated else { return }
++        if status.isDropped || !LocationEngine.isSessionActive {
++            startReconnect(to: sim, pairing: pairing, reason: "foreground")
++        }
++    }
++
++    private func handleNetworkChange(_ reason: String) {
++        NSLog("[Locus] %@", reason)
++        guard let sim = simulated, let pairing = activePairing else { return }
++        startReconnect(to: sim, pairing: pairing, reason: reason)
++    }
++
++    private func setOffMain(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore) async -> Result<Void, LocationEngineError> {
++        let generation = sessionGeneration
++        let path = pairing.pairingPath
++        let ip = TunnelConfig.targetIP
++        let lat = coordinate.latitude
++        let lon = coordinate.longitude
++        let result = await LocationEngine.setAsync(latitude: lat, longitude: lon, pairingPath: path, deviceIP: ip)
++        if !Task.isCancelled, sessionGeneration == generation, case .success = result {
++            recordSuccessfulWrite()
++        }
++        return result
++    }
++
++    /// A successful native write, not merely a connected VPN or an active timer.
++    private func recordSuccessfulWrite() {
++        lastSuccessfulWriteAt = Date()
++        successfulWriteCount += 1
++        NSLog("[Locus] location write succeeded (#%d)", successfulWriteCount)
++    }
++
++    /// Re-establish the developer session and re-send the last coordinate, off the
++    /// main thread until it works or the user stops. Never gate on Wi-Fi or internet
++    /// reachability: only the on-device tunnel needs to remain reachable.
++    /// `LocationEngine.set` first tries the existing session, so a network change that
++    /// didn't actually break anything costs one cheap call and no flicker.
++    private func startReconnect(to coordinate: CLLocationCoordinate2D, pairing: PairingStore, reason: String) {
++        guard !isStopping, reconnectTask == nil else { return }
++        NSLog("[Locus] reconnect start (%@)", reason)
++        stopResend()
++        stopHealth()
++        beginBackground()
++        audioKeepAlive.start()
++        let generation = sessionGeneration
++        // .reconnecting (rather than .connecting) so the Stop button is available.
++        status = .reconnecting
++        reconnectTask = Task { [weak self] in
++            var attempt = 0
++            while !Task.isCancelled {
++                guard let self else { return }
++                let target = self.simulated ?? coordinate
++                let result = await self.setOffMain(target, pairing: pairing)
++                if Task.isCancelled || self.sessionGeneration != generation { return }
++                switch result {
++                case .success:
++                    // A tap or route update may have changed the target while
++                    // the network operation was in flight. Apply that target first.
++                    if let latest = self.simulated,
++                       latest.latitude != target.latitude || latest.longitude != target.longitude {
++                        continue
++                    }
++                    self.finishReconnect(at: target, pairing: pairing)
++                    return
++                case .failure(let error):
++                    attempt += 1
++                    NSLog("[Locus] reconnect attempt %d failed: %@", attempt, String(describing: error))
++                    if attempt == 3 {
++                        self.postDropNotification(error.localizedDescription)
++                    }
++                }
++                // Keep retrying promptly after Wi-Fi loss instead of eventually
++                // waiting 30 seconds between writes to the local tunnel.
++                let delay = attempt == 1 ? 1 : Self.writeInterval
++                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
++            }
++        }
++    }
++
++    private func finishReconnect(at coordinate: CLLocationCoordinate2D, pairing: PairingStore) {
++        NSLog("[Locus] reconnect succeeded")
++        reconnectTask = nil
++        simulated = coordinate
++        pin = coordinate
++        status = .active
++        lastError = nil
++        beginBackground()
++        locationKeeper.start()
++        audioKeepAlive.start()
++        startResend(pairing: pairing)
++        startHealth(pairing: pairing)
++        persistSpoof(coordinate, force: true)
++    }
++
+     private func pushRecent(_ coordinate: CLLocationCoordinate2D) {
+         pushNamedRecent(
+             name: Self.coordinateLabel(coordinate),
+diff --git a/Locus/Features/Map/RootView.swift b/Locus/Features/Map/RootView.swift
+index 9d41e4c..9ce0a2f 100644
+--- a/Locus/Features/Map/RootView.swift
++++ b/Locus/Features/Map/RootView.swift
+@@ -4,6 +4,7 @@ import NetworkExtension
+ struct RootView: View {
+     @EnvironmentObject private var session: SpoofSession
+     @EnvironmentObject private var pairing: PairingStore
++    @Environment(\.scenePhase) private var scenePhase
+     @State private var showSettings = false
+     @State private var showPlaces = false
+ 
+@@ -20,6 +21,12 @@ struct RootView: View {
+             .padding(.horizontal, 16)
+             .padding(.bottom, 8)
+         }
++        .onAppear {
++            session.resumeIfNeeded(pairing: pairing)
++        }
++        .onChange(of: scenePhase) { _, phase in
++            if phase == .active { session.reconnectIfNeeded(pairing: pairing) }
++        }
+         .sheet(isPresented: $showSettings) {
+             SettingsView()
+         }
+@@ -126,9 +133,18 @@ struct StatusBarView: View {
+                 .frame(width: 8, height: 8)
+                 .shadow(color: color.opacity(0.7), radius: 4)
+ 
+-            Text(title)
+-                .font(.subheadline.weight(.semibold))
+-                .foregroundStyle(.primary)
++            VStack(alignment: .leading, spacing: 2) {
++                Text(title)
++                    .font(.subheadline.weight(.semibold))
++                    .foregroundStyle(.primary)
++                if let lastWrite = session.lastSuccessfulWriteAt {
++                    Text("Written \(lastWrite.formatted(date: .omitted, time: .standard)) · \(session.successfulWriteCount)")
++                        .font(.caption2.monospacedDigit())
++                        .foregroundStyle(.secondary)
++                        .lineLimit(1)
++                        .minimumScaleFactor(0.7)
++                }
++            }
+ 
+             Spacer(minLength: 8)
+ 
+diff --git a/Locus/Features/Settings/SettingsView.swift b/Locus/Features/Settings/SettingsView.swift
+index 87ca4b7..b7af2d0 100644
+--- a/Locus/Features/Settings/SettingsView.swift
++++ b/Locus/Features/Settings/SettingsView.swift
+@@ -10,6 +10,7 @@ struct SettingsView: View {
+     @State private var showPairOnDevice = false
+     @State private var showNameEasterEgg = false
+     @State private var tunnelIP = TunnelConfig.targetIP
++    @State private var tunnelPort = String(TunnelConfig.targetPort)
+     @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
+     @Environment(\.scenePhase) private var scenePhase
+ 
+@@ -71,11 +72,17 @@ struct SettingsView: View {
+                         .onSubmit {
+                             TunnelConfig.setTargetIP(tunnelIP)
+                         }
++                    TextField("Device tunnel port", text: $tunnelPort)
++                        .keyboardType(.numberPad)
+                     LabeledContent("Status") {
+                         Text(LocalDevVPN.isConnected ? "Connected" : "Not connected")
+                             .foregroundStyle(LocalDevVPN.isConnected ? LocusTheme.statusGood : LocusTheme.statusWarn)
+                     }
+-                    Button("Save tunnel IP") {
++                    Button("Save tunnel address") {
++                        guard TunnelConfig.setTargetPort(tunnelPort) else {
++                            session.lastError = "Tunnel port must be a number from 1 to 65535."
++                            return
++                        }
+                         TunnelConfig.setTargetIP(tunnelIP)
+                     }
+                     Button {
+diff --git a/README.md b/README.md
+index 5ff296f..04adb9c 100644
+--- a/README.md
++++ b/README.md
+@@ -46,6 +46,18 @@ Also install **[LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608
+ 
+ Start a teleport on Wi‑Fi first; the session can keep working on cellular afterward.
+ 
++While active, Locus re-sends the selected coordinates every 2 seconds and first
++reuses the existing developer session when the network changes. A failed write
++retries after 1 second, then every 2 seconds; requests never overlap. These are
++scheduling intervals, and a slow tunnel call can take longer.
++
++The status bar shows the last successful location-service write and its count.
++To check Wi‑Fi-to-cellular continuity, establish a teleport on Wi‑Fi, leave
++LocalDevVPN connected, disconnect Wi‑Fi, and check that the time and count keep
++advancing. Also verify the position in Maps and repeat with Locus in the background.
++A connected VPN alone does not confirm that its local tunnel is reachable;
++if iOS blocks that route or suspends Locus, continued writes cannot be guaranteed.
++
+ ### Pokémon GO & similar games
+ 
+ Locus spoofs location the same way Xcode’s developer tools do: it tells iOS “you’re here,” and other apps read that from the system. Apps that just trust GPS (Apple Maps, etc.) will follow it.
