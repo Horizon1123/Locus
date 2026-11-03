@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 jobs:
   build:
     runs-on: macos-15-intel
@@ -17,8 +18,19 @@ jobs:
           persist-credentials: false
       - name: Apply reviewed continuous-write source patch
         run: git apply --check locus-continuous.patch && git apply locus-continuous.patch
-      - name: Build native library with bounded location and tunnel operations
-        run: bash Vendor/idevice/build-locus-library.sh
+      - name: Apply nonmodal reconnect error fix
+        run: git apply --check locus-reconnect-alert-fix.patch && git apply locus-reconnect-alert-fix.patch
+      - name: Reuse verified native timeout library from build 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl --fail --location --silent --show-error \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Horizon1123/Locus/actions/artifacts/13249525792/zip \
+            -o native-library.zip
+          unzip -o native-library.zip -d Vendor/idevice
+          echo "aed9abbea795d9c288a7a1a5971446802c2ec235334cac3b7f7a311b235bbc48  Vendor/idevice/libidevice_ffi.a" | shasum -a 256 -c -
       - name: Configure this iPhone build
         run: |
           /usr/libexec/PlistBuddy -c 'Add :LocusTunnelPort integer 53493' Locus/Resources/Info.plist
@@ -29,7 +41,7 @@ jobs:
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= \
             PRODUCT_BUNDLE_IDENTIFIER=com.chrismack.locus.freetest \
-            MARKETING_VERSION=1.3.3 CURRENT_PROJECT_VERSION=10 \
+            MARKETING_VERSION=1.3.4 CURRENT_PROJECT_VERSION=11 \
             build 2>&1 | tee build.log
       - name: Package unsigned IPA for local signing
         run: |
@@ -37,17 +49,17 @@ jobs:
           ditto build/Build/Products/Release-iphoneos/Locus.app package/Payload/Locus.app
           /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Locus Test' package/Payload/Locus.app/Info.plist
           cd package
-          /usr/bin/zip -qry ../Locus-Continuous-1.3.3-build10.ipa Payload
+          /usr/bin/zip -qry ../Locus-Continuous-1.3.4-build11.ipa Payload
       - uses: actions/upload-artifact@v7
         with:
-          name: Locus-iPhone-build10
-          path: Locus-Continuous-1.3.3-build10.ipa
+          name: Locus-iPhone-build11
+          path: Locus-Continuous-1.3.4-build11.ipa
           if-no-files-found: error
           retention-days: 7
       - name: Upload patched native library
         uses: actions/upload-artifact@v7
         with:
-          name: Locus-native-library-build10
+          name: Locus-native-library-build11
           path: |
             Vendor/idevice/libidevice_ffi.a
             Vendor/idevice/idevice.h
