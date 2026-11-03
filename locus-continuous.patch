@@ -155,7 +155,7 @@ index 9c7bcfe..b1245d2 100644
          cleanup()
          if let err {
 diff --git a/Locus/Engine/SpoofSession.swift b/Locus/Engine/SpoofSession.swift
-index 1e362a9..0434f73 100644
+index 1e362a9..382bd77 100644
 --- a/Locus/Engine/SpoofSession.swift
 +++ b/Locus/Engine/SpoofSession.swift
 @@ -1,6 +1,9 @@
@@ -205,16 +205,17 @@ index 1e362a9..0434f73 100644
  @MainActor
  final class SpoofSession: ObservableObject {
      @Published var status: SpoofStatus = .idle
-@@ -78,6 +111,8 @@ final class SpoofSession: ObservableObject {
+@@ -78,6 +111,9 @@ final class SpoofSession: ObservableObject {
      @Published var lastError: String?
      @Published var isBusy = false
      @Published var joystickActive = false
 +    @Published private(set) var lastSuccessfulWriteAt: Date?
 +    @Published private(set) var successfulWriteCount = 0
++    @Published private(set) var lastTarget: CLLocationCoordinate2D?
  
      @Published var favorites: [SavedPlace] = []
      @Published var recents: [SavedPlace] = []
-@@ -89,13 +124,44 @@ final class SpoofSession: ObservableObject {
+@@ -89,13 +125,60 @@ final class SpoofSession: ObservableObject {
      private var backgroundTask = UIBackgroundTaskIdentifier.invalid
      private var joystickVector: CGVector = .zero
      private let locationKeeper = BackgroundKeepAlive()
@@ -233,10 +234,26 @@ index 1e362a9..0434f73 100644
      private let favoritesKey = "locus.favorites"
      private let recentsKey = "locus.recents"
 +    private let persistKey = "locus.lastSpoof"
++    private let targetKey = "locus.lastTarget"
++
++    private struct CachedTarget: Codable {
++        var latitude: Double
++        var longitude: Double
++
++        var coordinate: CLLocationCoordinate2D {
++            CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
++        }
++    }
  
      init() {
          favorites = SavedPlace.load(key: favoritesKey)
          recents = SavedPlace.load(key: recentsKey)
++        if let data = UserDefaults.standard.data(forKey: targetKey),
++           let saved = try? JSONDecoder().decode(CachedTarget.self, from: data),
++           CLLocationCoordinate2DIsValid(saved.coordinate) {
++            lastTarget = saved.coordinate
++            pin = saved.coordinate
++        }
 +
 +        // Wi‑Fi ↔ cellular switches (or a VPN toggle) can kill the developer
 +        // session even though LocalDevVPN still looks connected. Re-establish it
@@ -259,15 +276,17 @@ index 1e362a9..0434f73 100644
      }
  
      var isSpoofing: Bool {
-@@ -105,6 +171,7 @@ final class SpoofSession: ObservableObject {
+@@ -105,6 +188,9 @@ final class SpoofSession: ObservableObject {
      }
  
      func teleport(to coordinate: CLLocationCoordinate2D, pairing: PairingStore) {
++        guard CLLocationCoordinate2DIsValid(coordinate) else { return }
++        rememberTarget(coordinate)
 +        guard !isStopping else { return }
          guard pairing.hasPairingFile else {
              lastError = "Import an RPPairing file in Settings first."
              return
-@@ -114,26 +181,40 @@ final class SpoofSession: ObservableObject {
+@@ -114,26 +200,40 @@ final class SpoofSession: ObservableObject {
      }
  
      func stop(pairing: PairingStore) {
@@ -320,7 +339,7 @@ index 1e362a9..0434f73 100644
          }
      }
  
-@@ -148,6 +229,7 @@ final class SpoofSession: ObservableObject {
+@@ -148,6 +248,7 @@ final class SpoofSession: ObservableObject {
      }
  
      func startJoystick(pairing: PairingStore) {
@@ -328,7 +347,7 @@ index 1e362a9..0434f73 100644
          guard pairing.hasPairingFile else {
              lastError = "Import an RPPairing file in Settings first."
              return
-@@ -181,14 +263,15 @@ final class SpoofSession: ObservableObject {
+@@ -181,14 +282,15 @@ final class SpoofSession: ObservableObject {
      }
  
      func followRoute(_ coordinates: [CLLocationCoordinate2D], pairing: PairingStore) {
@@ -346,7 +365,7 @@ index 1e362a9..0434f73 100644
                  self.apply(previous, pairing: pairing, markRecent: true)
              }
              for next in coordinates.dropFirst() {
-@@ -208,7 +291,9 @@ final class SpoofSession: ObservableObject {
+@@ -208,7 +310,9 @@ final class SpoofSession: ObservableObject {
                      )
                      let delay = stepMeters / speed
                      try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -356,11 +375,14 @@ index 1e362a9..0434f73 100644
                          self.apply(coord, pairing: pairing, markRecent: false)
                      }
                  }
-@@ -288,6 +373,17 @@ final class SpoofSession: ObservableObject {
+@@ -288,6 +392,20 @@ final class SpoofSession: ObservableObject {
      }
  
      private func apply(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool) {
 +        guard !isStopping else { return }
++        // Persist the requested target before attempting I/O. Neither an
++        // unreachable tunnel nor a blocked native call may lose the user's point.
++        persistSpoof(coordinate, force: markRecent)
 +        coordinateRevision += 1
 +        activePairing = pairing
 +        // A reconnect loop owns the tunnel right now. Retarget it instead of blocking
@@ -374,7 +396,7 @@ index 1e362a9..0434f73 100644
          if status == .idle || status.isDropped {
              status = .connecting
          }
-@@ -301,22 +397,27 @@ final class SpoofSession: ObservableObject {
+@@ -301,22 +419,27 @@ final class SpoofSession: ObservableObject {
          isBusy = false
          switch result {
          case .success:
@@ -403,7 +425,7 @@ index 1e362a9..0434f73 100644
              } else {
                  status = .idle
              }
-@@ -324,7 +425,7 @@ final class SpoofSession: ObservableObject {
+@@ -324,7 +447,7 @@ final class SpoofSession: ObservableObject {
      }
  
      private func tickJoystick(pairing: PairingStore) {
@@ -412,7 +434,7 @@ index 1e362a9..0434f73 100644
          let magnitude = hypot(joystickVector.dx, joystickVector.dy)
          guard magnitude > 0.08 else { return }
          let nx = joystickVector.dx / magnitude
-@@ -338,20 +439,33 @@ final class SpoofSession: ObservableObject {
+@@ -338,20 +461,33 @@ final class SpoofSession: ObservableObject {
  
      private func startResend(pairing: PairingStore) {
          resendTimer?.invalidate()
@@ -455,7 +477,7 @@ index 1e362a9..0434f73 100644
          resendTimer?.invalidate()
          resendTimer = nil
      }
-@@ -360,13 +474,9 @@ final class SpoofSession: ObservableObject {
+@@ -360,13 +496,9 @@ final class SpoofSession: ObservableObject {
          healthTimer?.invalidate()
          healthTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
              Task { @MainActor in
@@ -472,7 +494,7 @@ index 1e362a9..0434f73 100644
                  }
              }
          }
-@@ -377,6 +487,160 @@ final class SpoofSession: ObservableObject {
+@@ -377,6 +509,174 @@ final class SpoofSession: ObservableObject {
          healthTimer = nil
      }
  
@@ -481,7 +503,7 @@ index 1e362a9..0434f73 100644
 +    private struct PersistedSpoof: Codable {
 +        var latitude: Double
 +        var longitude: Double
-+        var bootTime: TimeInterval
++        var bootTime: TimeInterval?
 +    }
 +
 +    private static func bootTime() -> TimeInterval? {
@@ -492,21 +514,31 @@ index 1e362a9..0434f73 100644
 +        return TimeInterval(tv.tv_sec)
 +    }
 +
-+    /// Remember the last teleport so it can be restored after the app is killed.
-+    /// Throttled so the joystick (4 updates/s) doesn't hammer UserDefaults.
++    /// Save the target immediately; throttle only the separate active-session
++    /// record. Reading kernel boot metadata must never be required to save a point.
 +    private func persistSpoof(_ coordinate: CLLocationCoordinate2D, force: Bool = false) {
++        rememberTarget(coordinate)
 +        let now = Date()
-+        guard force || now.timeIntervalSince(lastPersist) > 2,
-+              let bootTime = Self.bootTime() else { return }
++        guard force || now.timeIntervalSince(lastPersist) > 2 else { return }
 +        lastPersist = now
 +        let value = PersistedSpoof(
 +            latitude: coordinate.latitude,
 +            longitude: coordinate.longitude,
-+            bootTime: bootTime
++            bootTime: Self.bootTime()
 +        )
 +        if let data = try? JSONEncoder().encode(value) {
 +            UserDefaults.standard.set(data, forKey: persistKey)
 +        }
++    }
++
++    private func rememberTarget(_ coordinate: CLLocationCoordinate2D) {
++        guard CLLocationCoordinate2DIsValid(coordinate) else { return }
++        if let lastTarget, lastTarget.latitude == coordinate.latitude,
++           lastTarget.longitude == coordinate.longitude { return }
++        let value = CachedTarget(latitude: coordinate.latitude, longitude: coordinate.longitude)
++        guard let data = try? JSONEncoder().encode(value) else { return }
++        UserDefaults.standard.set(data, forKey: targetKey)
++        lastTarget = coordinate
 +    }
 +
 +    private func clearPersistedSpoof() {
@@ -521,12 +553,16 @@ index 1e362a9..0434f73 100644
 +        guard !isStopping, status == .idle, reconnectTask == nil, pairing.hasPairingFile,
 +              let data = UserDefaults.standard.data(forKey: persistKey),
 +              let saved = try? JSONDecoder().decode(PersistedSpoof.self, from: data) else { return }
-+        guard let bootTime = Self.bootTime(), saved.bootTime == bootTime,
-+              CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: saved.latitude, longitude: saved.longitude)) else {
++        guard CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: saved.latitude, longitude: saved.longitude)) else {
++            clearPersistedSpoof()
++            return
++        }
++        if let savedBoot = saved.bootTime, let currentBoot = Self.bootTime(), savedBoot != currentBoot {
 +            clearPersistedSpoof()
 +            return
 +        }
 +        let coordinate = CLLocationCoordinate2D(latitude: saved.latitude, longitude: saved.longitude)
++        rememberTarget(coordinate)
 +        pin = coordinate
 +        simulated = coordinate
 +        startReconnect(to: coordinate, pairing: pairing, reason: "resume after relaunch")
@@ -634,7 +670,7 @@ index 1e362a9..0434f73 100644
          pushNamedRecent(
              name: Self.coordinateLabel(coordinate),
 diff --git a/Locus/Features/Map/RootView.swift b/Locus/Features/Map/RootView.swift
-index 9d41e4c..9ce0a2f 100644
+index 9d41e4c..c417483 100644
 --- a/Locus/Features/Map/RootView.swift
 +++ b/Locus/Features/Map/RootView.swift
 @@ -4,6 +4,7 @@ import NetworkExtension
@@ -658,7 +694,7 @@ index 9d41e4c..9ce0a2f 100644
          .sheet(isPresented: $showSettings) {
              SettingsView()
          }
-@@ -126,9 +133,18 @@ struct StatusBarView: View {
+@@ -126,9 +133,24 @@ struct StatusBarView: View {
                  .frame(width: 8, height: 8)
                  .shadow(color: color.opacity(0.7), radius: 4)
  
@@ -671,6 +707,12 @@ index 9d41e4c..9ce0a2f 100644
 +                    .foregroundStyle(.primary)
 +                if let lastWrite = session.lastSuccessfulWriteAt {
 +                    Text("Written \(lastWrite.formatted(date: .omitted, time: .standard)) · \(session.successfulWriteCount)")
++                        .font(.caption2.monospacedDigit())
++                        .foregroundStyle(.secondary)
++                        .lineLimit(1)
++                        .minimumScaleFactor(0.7)
++                } else if let target = session.lastTarget {
++                    Text(String(format: "Saved target %.4f, %.4f", target.latitude, target.longitude))
 +                        .font(.caption2.monospacedDigit())
 +                        .foregroundStyle(.secondary)
 +                        .lineLimit(1)
