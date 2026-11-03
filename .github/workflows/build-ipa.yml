@@ -27,7 +27,7 @@ jobs:
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= \
             PRODUCT_BUNDLE_IDENTIFIER=com.chrismack.locus.freetest \
-            MARKETING_VERSION=1.3.1 CURRENT_PROJECT_VERSION=8 \
+            MARKETING_VERSION=1.3.2 CURRENT_PROJECT_VERSION=9 \
             build 2>&1 | tee build.log
       - name: Package unsigned IPA for local signing
         run: |
@@ -35,11 +35,11 @@ jobs:
           ditto build/Build/Products/Release-iphoneos/Locus.app package/Payload/Locus.app
           /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Locus Test' package/Payload/Locus.app/Info.plist
           cd package
-          /usr/bin/zip -qry ../Locus-Continuous-1.3.1-build8.ipa Payload
+          /usr/bin/zip -qry ../Locus-Continuous-1.3.2-build9.ipa Payload
       - uses: actions/upload-artifact@v7
         with:
-          name: Locus-iPhone-build8
-          path: Locus-Continuous-1.3.1-build8.ipa
+          name: Locus-iPhone-build9
+          path: Locus-Continuous-1.3.2-build9.ipa
           if-no-files-found: error
           retention-days: 7
       - name: Upload build log
