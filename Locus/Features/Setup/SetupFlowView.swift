@@ -327,7 +327,7 @@ struct SetupFlowView: View {
                         tipRow(systemImage: "arrow.down.app.fill", title: "Install", detail: "Get LocalDevVPN from the App Store.")
                         tipRow(systemImage: "power.circle.fill", title: "Connect", detail: "Open it and turn the VPN on. Leave the default IP alone.")
                     }
-                    tipRow(systemImage: "wifi", title: "First teleport on Wi‑Fi", detail: "Start your first teleport while on Wi‑Fi. After that, it can keep working on cellular.")
+                    tipRow(systemImage: "wifi", title: "Stay connected to Wi‑Fi", detail: "For mobile data, try another phone’s hotspot. Keep this iPhone connected and confirm location changes in Locus and Maps.")
                 }
                 .padding(18)
                 .locusGlass(.regular, in: RoundedRectangle(cornerRadius: 20, style: .continuous))

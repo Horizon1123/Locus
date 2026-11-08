@@ -10,6 +10,7 @@ struct SettingsView: View {
     @State private var showPairOnDevice = false
     @State private var showNameEasterEgg = false
     @State private var tunnelIP = TunnelConfig.targetIP
+    @State private var tunnelPort = String(TunnelConfig.targetPort)
     @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
     @Environment(\.scenePhase) private var scenePhase
 
@@ -71,11 +72,17 @@ struct SettingsView: View {
                         .onSubmit {
                             TunnelConfig.setTargetIP(tunnelIP)
                         }
+                    TextField("Device tunnel port", text: $tunnelPort)
+                        .keyboardType(.numberPad)
                     LabeledContent("Status") {
                         Text(LocalDevVPN.isConnected ? "Connected" : "Not connected")
                             .foregroundStyle(LocalDevVPN.isConnected ? LocusTheme.statusGood : LocusTheme.statusWarn)
                     }
-                    Button("Save tunnel IP") {
+                    Button("Save tunnel address") {
+                        guard TunnelConfig.setTargetPort(tunnelPort) else {
+                            session.lastError = "Tunnel port must be a number from 1 to 65535."
+                            return
+                        }
                         TunnelConfig.setTargetIP(tunnelIP)
                     }
                     Button {
@@ -93,7 +100,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Tunnel")
                 } footer: {
-                    Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. Start a spoof on Wi‑Fi first; it can keep working on cellular afterward.")
+                    Text("Connect LocalDevVPN before teleporting. Default tunnel IP is 10.7.0.1. For mobile data, try another phone’s hotspot and keep this iPhone connected to it. This uses the hotspot phone’s data. Verify the Written time and count, then check Maps; a connected VPN alone does not confirm a location change.")
                 }
 
                 Section("Privacy") {

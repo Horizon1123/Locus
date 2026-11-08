@@ -4,6 +4,7 @@ import NetworkExtension
 struct RootView: View {
     @EnvironmentObject private var session: SpoofSession
     @EnvironmentObject private var pairing: PairingStore
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
     @State private var showPlaces = false
 
@@ -19,6 +20,12 @@ struct RootView: View {
             )
             .padding(.horizontal, 16)
             .padding(.bottom, 8)
+        }
+        .onAppear {
+            session.resumeIfNeeded(pairing: pairing)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { session.reconnectIfNeeded(pairing: pairing) }
         }
         .sheet(isPresented: $showSettings) {
             SettingsView()
@@ -126,9 +133,30 @@ struct StatusBarView: View {
                 .frame(width: 8, height: 8)
                 .shadow(color: color.opacity(0.7), radius: 4)
 
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.primary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                if let error = session.reconnectError, case .reconnecting = session.status {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(LocusTheme.statusWarn)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let lastWrite = session.lastSuccessfulWriteAt {
+                    Text("Written \(lastWrite.formatted(date: .omitted, time: .standard)) · \(session.successfulWriteCount)")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                } else if let target = session.lastTarget {
+                    Text(String(format: "Saved target %.4f, %.4f", target.latitude, target.longitude))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                }
+            }
 
             Spacer(minLength: 8)
 

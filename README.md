@@ -44,7 +44,37 @@ Locus uses the MIT-licensed [idevice](https://github.com/jkcoxson/idevice) FFI t
 
 Also install **[LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044)** (loopback tunnel, default `10.7.0.1`), then sideload Locus.
 
-Start a teleport on Wi‑Fi first; the session can keep working on cellular afterward.
+The developer tunnel must remain reachable for continued writes. Starting on
+Wi‑Fi does not guarantee continuity on cellular. On the tested iPhone 13 with
+iOS 18.1.1 and LocalDevVPN 1.3.0, both `10.7.0.1` and `127.0.0.1` failed after
+Wi‑Fi was disabled. The last coordinate remains cached, but cannot be written
+to the system until a working tunnel is available.
+
+If mobile internet through another device is acceptable, try connecting the
+iPhone running Locus to a second phone's cellular hotspot. This keeps the
+target iPhone associated with Wi-Fi while internet traffic uses the hotspot
+phone's mobile data. This is a workaround to validate on the device, not a
+verified fix for cellular-only operation. See [the hotspot setup and checks](SETUP.md#5-mobile-data-through-another-phones-hotspot).
+
+The native location and tunnel operations have deadlines, so a silent peer
+returns an error and the last target can be retried on a fresh connection.
+Manual teleports use the same asynchronous writer and do not block the UI.
+
+While active, Locus re-sends the selected coordinates every 2 seconds and first
+reuses the existing developer session when the network changes. A failed write
+retries after 1 second, then every 2 seconds; requests never overlap. These are
+scheduling intervals, and a slow tunnel call can take longer.
+Automatic connection failures appear in the status bar instead of repeatedly
+opening an alert. Reconnecting does not mean a coordinate was successfully written.
+
+The status bar shows the last successful location-service write and its count.
+For a separate diagnostic test of direct Wi‑Fi-to-cellular continuity, establish a teleport on Wi‑Fi, leave
+LocalDevVPN connected, disconnect Wi‑Fi, and check that the time and count keep
+advancing. Also verify the position in Maps and repeat with Locus in the background.
+Keep Wi‑Fi connected during normal hotspot use; this diagnostic deliberately
+tests the unsupported cellular-only path.
+A connected VPN alone does not confirm that its local tunnel is reachable;
+if iOS blocks that route or suspends Locus, continued writes cannot be guaranteed.
 
 ### Pokémon GO & similar games
 
@@ -59,6 +89,11 @@ Locus is for system-level teleporting. It isn’t a Pokémon GO client or an ant
 ## Build
 
 Building from source needs an Apple Developer account (free or paid) for code signing. The published IPA does **not** — just sideload it.
+
+Before building this branch, run `bash Vendor/idevice/build-locus-library.sh`
+with Xcode and Rust installed. This rebuilds the pinned native dependency with
+the deadline patch and runs its stalled-peer regression checks. The Swift
+wrapper requires the patched library; the original binary is insufficient.
 
 1. Install [XcodeGen](https://github.com/yonaskolb/XcodeGen) if needed: `brew install xcodegen`
 2. Set your **Team ID** in `project.yml` (`DEVELOPMENT_TEAM`), *or* pick your team under Xcode → Signing & Capabilities after generating the project.
