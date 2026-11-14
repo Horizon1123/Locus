@@ -35,6 +35,7 @@ enum LocationEngineError: LocalizedError {
         case 10: return .simulationCreate
         case 11: return .locationSet
         case 12: return .locationClear
+        case 13: return .cancelled
         default: return .locationSet
         }
     }
@@ -76,6 +77,7 @@ enum LocationEngine {
     private static let simulationCreate: Int32 = 10
     private static let locationSet: Int32 = 11
     private static let locationClear: Int32 = 12
+    private static let cancelled: Int32 = 13
 
     static var isSessionActive: Bool {
         sessionStateLock.lock()
@@ -100,7 +102,7 @@ enum LocationEngine {
                         continuation.resume(returning: .failure(.cancelled))
                         return
                     }
-                    let code = setLocked(latitude: latitude, longitude: longitude, pairingPath: pairingPath, deviceIP: deviceIP)
+                    let code = setLocked(latitude: latitude, longitude: longitude, pairingPath: pairingPath, deviceIP: deviceIP, shouldCancel: { request.isCancelled })
                     continuation.resume(returning: code == ok ? .success(()) : .failure(.from(code: code)))
                 }
             }
@@ -157,7 +159,7 @@ enum LocationEngine {
         }
     }
 
-    private static func setLocked(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) -> Int32 {
+    private static func setLocked(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String, shouldCancel: () -> Bool = { false }) -> Int32 {
         let started = Date()
         NSLog("[Locus] native write started")
         defer { NSLog("[Locus] native write returned after %.2fs", Date().timeIntervalSince(started)) }
@@ -173,12 +175,9 @@ enum LocationEngine {
             }
         }
 
-        var address = sockaddr_in()
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = in_port_t(TunnelConfig.targetPort).bigEndian
-        let inetResult = deviceIP.withCString { inet_pton(AF_INET, $0, &address.sin_addr) }
-        guard inetResult == 1 else { return invalidIP }
-
+        // Reject an invalid configured address rather than silently masking a typo.
+        guard isValidAddress(deviceIP) else { return invalidIP }
+        let port = TunnelConfig.targetPort
         var pairingHandle: OpaquePointer?
         if let pairingError = pairingPath.withCString({ rp_pairing_file_read($0, &pairingHandle) }) {
             idevice_error_free(pairingError)
@@ -187,48 +186,92 @@ enum LocationEngine {
         guard let pairingHandle else { return pairingRead }
         defer { rp_pairing_file_free(pairingHandle) }
 
-        let providerError = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                tunnel_create_rppairing(
-                    $0,
-                    socklen_t(MemoryLayout<sockaddr_in>.stride),
-                    "LocusLocation",
-                    pairingHandle,
-                    nil,
-                    nil,
-                    &adapter,
-                    &handshake
-                )
+        var lastCode = tunnelCreate
+        for host in candidateHosts(configured: deviceIP) {
+            guard !shouldCancel() else { return cancelled }
+            let code = openSession(host: host, port: port, pairing: pairingHandle,
+                                   latitude: latitude, longitude: longitude)
+            if code == ok { return ok }
+            lastCode = code
+        }
+        return lastCode
+    }
+
+    static func candidateHosts(configured: String) -> [String] {
+        var hosts: [String] = []
+        for host in [configured, "127.0.0.1", "::1"] where !hosts.contains(host) {
+            hosts.append(host)
+        }
+        return hosts
+    }
+
+    private static func isValidAddress(_ host: String) -> Bool {
+        var v4 = in_addr()
+        var v6 = in6_addr()
+        return host.withCString { inet_pton(AF_INET, $0, &v4) == 1 || inet_pton(AF_INET6, $0, &v6) == 1 }
+    }
+
+    /// Keep the sockaddr alive until the synchronous FFI call has returned.
+    private static func openSession(host: String, port: UInt16, pairing: OpaquePointer,
+                                    latitude: Double, longitude: Double) -> Int32 {
+        NSLog("[Locus] trying developer endpoint [%@]:%u", host, UInt32(port))
+        var address4 = sockaddr_in()
+        address4.sin_len = UInt8(MemoryLayout<sockaddr_in>.stride)
+        address4.sin_family = sa_family_t(AF_INET)
+        address4.sin_port = port.bigEndian
+        let isV4 = host.withCString { inet_pton(AF_INET, $0, &address4.sin_addr) == 1 }
+        let providerError: UnsafeMutablePointer<IdeviceFfiError>?
+        if isV4 {
+            providerError = withUnsafePointer(to: &address4) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    tunnel_create_rppairing($0, socklen_t(MemoryLayout<sockaddr_in>.stride),
+                        "LocusLocation", pairing, nil, nil, &adapter, &handshake)
+                }
+            }
+        } else {
+            var address6 = sockaddr_in6()
+            address6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.stride)
+            address6.sin6_family = sa_family_t(AF_INET6)
+            address6.sin6_port = port.bigEndian
+            guard host.withCString({ inet_pton(AF_INET6, $0, &address6.sin6_addr) == 1 }) else { return invalidIP }
+            providerError = withUnsafePointer(to: &address6) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    tunnel_create_rppairing($0, socklen_t(MemoryLayout<sockaddr_in6>.stride),
+                        "LocusLocation", pairing, nil, nil, &adapter, &handshake)
+                }
             }
         }
         if let providerError {
-            NSLog("[Locus] fresh tunnel failed")
-            idevice_error_free(providerError)
+            logAndFree(providerError, stage: "tunnel", host: host)
             cleanup()
             return tunnelCreate
         }
-
-        if let remoteServerError = remote_server_connect_rsd(adapter, handshake, &remoteServer) {
-            idevice_error_free(remoteServerError)
+        if let error = remote_server_connect_rsd(adapter, handshake, &remoteServer) {
+            logAndFree(error, stage: "RemoteXPC", host: host)
             cleanup()
             return remoteServerCode
         }
-
-        if let simError = location_simulation_new(remoteServer, &locationSimulation) {
-            idevice_error_free(simError)
+        if let error = location_simulation_new(remoteServer, &locationSimulation) {
+            logAndFree(error, stage: "location service", host: host)
             cleanup()
             return simulationCreate
         }
-        // The location handle borrows the server. Keep its owner until cleanup,
-        // then free the location handle before the server and tunnel adapter.
-
-        if let setError = location_simulation_set(locationSimulation, latitude, longitude) {
-            idevice_error_free(setError)
+        // The location handle borrows remoteServer, whose owner survives until cleanup.
+        if let error = location_simulation_set(locationSimulation, latitude, longitude) {
+            logAndFree(error, stage: "location write", host: host)
             cleanup()
             return locationSet
         }
         updateSessionState(true)
+        NSLog("[Locus] developer endpoint ready [%@]:%u", host, UInt32(port))
         return ok
+    }
+
+    private static func logAndFree(_ error: UnsafeMutablePointer<IdeviceFfiError>, stage: String, host: String) {
+        let message = error.pointee.message.map { String(cString: $0) } ?? "No detail"
+        NSLog("[Locus] %@ failed [%@] code=%d subcode=%d: %@", stage, host,
+              error.pointee.code, error.pointee.sub_code, String(message.prefix(300)))
+        idevice_error_free(error)
     }
 
     private static func clearLocked() -> Int32 {
