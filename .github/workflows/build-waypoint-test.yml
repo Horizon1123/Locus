@@ -1,4 +1,4 @@
-name: Build Waypoint cellular diagnostics
+name: Build Waypoint native timeout test
 on:
   push:
     branches: ['codex/waypoint-test-20261117']
@@ -8,7 +8,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-15-intel
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
@@ -28,8 +28,21 @@ jobs:
           git diff > waypoint-port.patch
       - name: Install XcodeGen
         run: command -v xcodegen || brew install xcodegen
-      - name: Fetch verified upstream library
-        run: bash scripts/fetch-idevice.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-apple-ios
+      - name: Build native timeouts with developer-image support
+        env:
+          LOCUS_NATIVE_FEATURES: ring dvt location_simulation remote_pairing tunnel_tcp_stack obfuscate mobile_image_mounter tss
+        run: |
+          bash locus-test-build-tools/Vendor/idevice/build-locus-library.sh
+          cp locus-test-build-tools/Vendor/idevice/libidevice_ffi.a Vendor/idevice/
+          cp locus-test-build-tools/Vendor/idevice/idevice.h Vendor/idevice/
+          cp locus-test-build-tools/Vendor/idevice/locus-timeout.patch native-timeout.patch
+          cp locus-test-build-tools/Vendor/idevice/build-locus-library.sh native-build-recipe.sh
+          shasum -a 256 Vendor/idevice/libidevice_ffi.a Vendor/idevice/idevice.h > native-SHA256SUMS
+          tar -czf Waypoint-native-source.tar.gz --exclude .git --exclude target -C locus-test-build-tools/Vendor/idevice-build .
       - name: Generate project and build
         run: |
           set -o pipefail
@@ -37,22 +50,24 @@ jobs:
           xcodebuild -project Waypoint.xcodeproj -scheme Waypoint -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= \
-            CURRENT_PROJECT_VERSION=14 build 2>&1 | tee build.log
+            CURRENT_PROJECT_VERSION=15 IPHONEOS_DEPLOYMENT_TARGET=18.0 build 2>&1 | tee build.log
       - name: Package app and corresponding source
         run: |
           mkdir -p package/Payload
           ditto build/Build/Products/Release-iphoneos/Waypoint.app package/Payload/Waypoint.app
-          (cd package && /usr/bin/zip -qry ../Waypoint-1.0.5-port60142-build14.ipa Payload)
-          git ls-files -z | tar --null -T - -czf Waypoint-1.0.5-port60142-source.tar.gz
-          shasum -a 256 Waypoint-1.0.5-port60142-build14.ipa > SHA256SUMS
+          (cd package && /usr/bin/zip -qry ../Waypoint-1.0.5-port60142-build15.ipa Payload)
+          { git ls-files -z; printf 'native-timeout.patch\0native-build-recipe.sh\0native-SHA256SUMS\0'; } | tar --null -T - -czf Waypoint-1.0.5-port60142-source.tar.gz
+          shasum -a 256 Waypoint-1.0.5-port60142-build15.ipa > SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
-          name: Waypoint-port60142-build14
+          name: Waypoint-port60142-build15
           path: |
-            Waypoint-1.0.5-port60142-build14.ipa
+            Waypoint-1.0.5-port60142-build15.ipa
             Waypoint-1.0.5-port60142-source.tar.gz
             waypoint-port.patch
             SHA256SUMS
+            native-SHA256SUMS
+            Waypoint-native-source.tar.gz
           retention-days: 7
       - uses: actions/upload-artifact@v7
         if: always()

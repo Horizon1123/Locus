@@ -103,3 +103,17 @@ s=s[:start]+'''                let verificationDeadline = Date().addingTimeInter
                 }
 ''' + s[end:];p.write_text(s)
 print('Applied device port, successful native-write diagnostics, and bounded strict cellular verification.')
+
+# This build links the matched header/library pair with native timeout support.
+edit('Waypoint/Services/DeviceBridge.swift',
+     '    private func connectSynchronously(pairingPath: String) throws {',
+     '    private func connectSynchronously(pairingPath: String) throws {\n        idevice_set_global_timeout(5)\n        NSLog("[WaypointTest] native timeout patch v%u", locus_idevice_timeout_patch_version())')
+edit('Waypoint/Services/DeviceBridge.swift',
+     '            do {\n                try self.consume(\n                    location_simulation_set',
+     '            do {\n                NSLog("[WaypointTest] native write started")\n                try self.consume(\n                    location_simulation_set')
+edit('Waypoint/Services/DeviceBridge.swift',
+     '        if let adapter {\n            adapter_free(adapter)',
+     '        if let adapter {\n            if let error = adapter_close(adapter) { idevice_error_free(error) }\n            adapter_free(adapter)')
+edit('Waypoint/App/AppModel+CellularHandoff.swift',
+     'The retained spoof session stopped responding when mobile data returned. Turn Airplane Mode on and try the guided start again.',
+     'The retained spoof session stopped responding when mobile data returned.\\n\\n\\(error.localizedDescription)')

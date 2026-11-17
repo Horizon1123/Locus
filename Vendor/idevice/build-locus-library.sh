@@ -5,7 +5,7 @@ set -euo pipefail
 # in-flight Rust future. Native deadlines must drop that future before returning.
 project_dir="$(cd "$(dirname "$0")/../.." && pwd)"
 revision=89702099f4d7552f704f93b4526756abda319ceb
-features='ring dvt location_simulation remote_pairing tunnel_tcp_stack obfuscate'
+features="${LOCUS_NATIVE_FEATURES:-ring dvt location_simulation remote_pairing tunnel_tcp_stack obfuscate}"
 mkdir -p "$project_dir/Vendor/idevice-build"
 source_dir="$(mktemp -d "$project_dir/Vendor/idevice-build/locus.XXXXXX")"
 git -C "$source_dir" init -q
