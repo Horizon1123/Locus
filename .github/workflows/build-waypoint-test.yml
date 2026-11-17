@@ -1,0 +1,66 @@
+name: Build Waypoint port test
+on:
+  push:
+    branches: ['codex/waypoint-test-20261117']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: raph559/WaypointApp
+          ref: 61809b6348df5b835745ec17c61e4d81ed93d705
+          persist-credentials: false
+      - name: Adapt developer service port
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Waypoint/Services/DeviceBridge.swift')
+          text = p.read_text()
+          old = 'static let remotePairingPort: UInt16 = 49_152'
+          assert text.count(old) == 1
+          p.write_text(text.replace(old, 'static let remotePairingPort: UInt16 = 60_142'))
+          PY
+          git diff --check
+          git diff > waypoint-port.patch
+      - name: Install XcodeGen
+        run: command -v xcodegen || brew install xcodegen
+      - name: Fetch verified upstream library
+        run: bash scripts/fetch-idevice.sh
+      - name: Generate project and build
+        run: |
+          set -o pipefail
+          xcodegen generate
+          xcodebuild -project Waypoint.xcodeproj -scheme Waypoint -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= \
+            CURRENT_PROJECT_VERSION=13 build 2>&1 | tee build.log
+      - name: Package app and corresponding source
+        run: |
+          mkdir -p package/Payload
+          ditto build/Build/Products/Release-iphoneos/Waypoint.app package/Payload/Waypoint.app
+          (cd package && /usr/bin/zip -qry ../Waypoint-1.0.5-port60142-build13.ipa Payload)
+          git ls-files -z | tar --null -T - -czf Waypoint-1.0.5-port60142-source.tar.gz
+          shasum -a 256 Waypoint-1.0.5-port60142-build13.ipa > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Waypoint-port60142-build13
+          path: |
+            Waypoint-1.0.5-port60142-build13.ipa
+            Waypoint-1.0.5-port60142-source.tar.gz
+            waypoint-port.patch
+            SHA256SUMS
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: Waypoint-build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
