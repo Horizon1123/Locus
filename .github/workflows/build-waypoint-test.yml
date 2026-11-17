@@ -1,4 +1,4 @@
-name: Build Waypoint port test
+name: Build Waypoint cellular diagnostics
 on:
   push:
     branches: ['codex/waypoint-test-20261117']
@@ -17,16 +17,13 @@ jobs:
           repository: raph559/WaypointApp
           ref: 61809b6348df5b835745ec17c61e4d81ed93d705
           persist-credentials: false
-      - name: Adapt developer service port
+      - uses: actions/checkout@v7
+        with:
+          path: locus-test-build-tools
+          persist-credentials: false
+      - name: Adapt port and instrument cellular test
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('Waypoint/Services/DeviceBridge.swift')
-          text = p.read_text()
-          old = 'static let remotePairingPort: UInt16 = 49_152'
-          assert text.count(old) == 1
-          p.write_text(text.replace(old, 'static let remotePairingPort: UInt16 = 60_142'))
-          PY
+          python3 locus-test-build-tools/.github/scripts/adapt-waypoint-test.py
           git diff --check
           git diff > waypoint-port.patch
       - name: Install XcodeGen
@@ -40,19 +37,19 @@ jobs:
           xcodebuild -project Waypoint.xcodeproj -scheme Waypoint -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= \
-            CURRENT_PROJECT_VERSION=13 build 2>&1 | tee build.log
+            CURRENT_PROJECT_VERSION=14 build 2>&1 | tee build.log
       - name: Package app and corresponding source
         run: |
           mkdir -p package/Payload
           ditto build/Build/Products/Release-iphoneos/Waypoint.app package/Payload/Waypoint.app
-          (cd package && /usr/bin/zip -qry ../Waypoint-1.0.5-port60142-build13.ipa Payload)
+          (cd package && /usr/bin/zip -qry ../Waypoint-1.0.5-port60142-build14.ipa Payload)
           git ls-files -z | tar --null -T - -czf Waypoint-1.0.5-port60142-source.tar.gz
-          shasum -a 256 Waypoint-1.0.5-port60142-build13.ipa > SHA256SUMS
+          shasum -a 256 Waypoint-1.0.5-port60142-build14.ipa > SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
-          name: Waypoint-port60142-build13
+          name: Waypoint-port60142-build14
           path: |
-            Waypoint-1.0.5-port60142-build13.ipa
+            Waypoint-1.0.5-port60142-build14.ipa
             Waypoint-1.0.5-port60142-source.tar.gz
             waypoint-port.patch
             SHA256SUMS
