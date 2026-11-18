@@ -3,7 +3,52 @@ from pathlib import Path
 def edit(name, old, new):
     p=Path(name);s=p.read_text();assert s.count(old)==1,(name,old[:80],s.count(old));p.write_text(s.replace(old,new))
 
-edit('Waypoint/Services/DeviceBridge.swift', 'static let remotePairingPort: UInt16 = 49_152', 'static let remotePairingPort: UInt16 = 60_142')
+edit('Waypoint/Services/DeviceBridge.swift', '    static let remotePairingPort: UInt16 = 49_152', '''    static let defaultRemotePairingPort: UInt16 = 49_152
+    static let remotePairingPortKey = "WaypointTest.remotePairingPort"
+
+    static var remotePairingPort: UInt16 {
+        let saved = UserDefaults.standard.integer(forKey: remotePairingPortKey)
+        guard let port = UInt16(exactly: saved), port > 0 else { return defaultRemotePairingPort }
+        return port
+    }''')
+edit('Waypoint/Services/DeviceBridge.swift',
+     '        address.sin_port = in_port_t(Self.remotePairingPort).bigEndian',
+     '''        let port = Self.remotePairingPort
+        address.sin_port = in_port_t(port).bigEndian
+        NSLog("[WaypointTest] connecting to developer service port=%d", Int(port))''')
+edit('Waypoint/Views/SetupView.swift',
+     '    @State private var isSideStoreConfirmationPresented = false',
+     '''    @State private var isSideStoreConfirmationPresented = false
+    @State private var servicePortText = String(DeviceBridge.remotePairingPort)
+
+    private var enteredServicePort: UInt16? {
+        guard let port = UInt16(servicePortText.trimmingCharacters(in: .whitespacesAndNewlines)),
+              port > 0 else { return nil }
+        return port
+    }''')
+edit('Waypoint/Views/SetupView.swift',
+     '''            Section {
+                Toggle(
+                    "Notify If Spoof Stops",''',
+     '''            Section {
+                TextField("Developer service port", text: $servicePortText)
+                    .keyboardType(.numberPad)
+                    .accessibilityLabel("Developer service port")
+                Button("Save Port") {
+                    guard let port = enteredServicePort else { return }
+                    UserDefaults.standard.set(Int(port), forKey: DeviceBridge.remotePairingPortKey)
+                    servicePortText = String(port)
+                }
+                .disabled(enteredServicePort == nil || enteredServicePort == DeviceBridge.remotePairingPort)
+            } header: {
+                Text("Developer Connection")
+            } footer: {
+                Text("Default: 49152. A saved port is used the next time Waypoint connects.")
+            }
+
+            Section {
+                Toggle(
+                    "Notify If Spoof Stops",''')
 edit('Waypoint/Services/DeviceBridge.swift', '''                    fallback: "The device rejected the simulated location."
                 )''', '''                    fallback: "The device rejected the simulated location."
                 )

@@ -50,20 +50,20 @@ jobs:
           xcodebuild -project Waypoint.xcodeproj -scheme Waypoint -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= \
-            CURRENT_PROJECT_VERSION=15 IPHONEOS_DEPLOYMENT_TARGET=18.0 build 2>&1 | tee build.log
+            CURRENT_PROJECT_VERSION=16 IPHONEOS_DEPLOYMENT_TARGET=18.0 build 2>&1 | tee build.log
       - name: Package app and corresponding source
         run: |
           mkdir -p package/Payload
           ditto build/Build/Products/Release-iphoneos/Waypoint.app package/Payload/Waypoint.app
-          (cd package && /usr/bin/zip -qry ../Waypoint-1.0.5-port60142-build15.ipa Payload)
-          { git ls-files -z; printf 'native-timeout.patch\0native-build-recipe.sh\0native-SHA256SUMS\0'; } | tar --null -T - -czf Waypoint-1.0.5-port60142-source.tar.gz
-          shasum -a 256 Waypoint-1.0.5-port60142-build15.ipa > SHA256SUMS
+          (cd package && /usr/bin/zip -qry ../Waypoint-1.0.5-build16.ipa Payload)
+          { git ls-files -z; printf 'native-timeout.patch\0native-build-recipe.sh\0native-SHA256SUMS\0'; } | tar --null -T - -czf Waypoint-1.0.5-build16-source.tar.gz
+          shasum -a 256 Waypoint-1.0.5-build16.ipa > SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
-          name: Waypoint-port60142-build15
+          name: Waypoint-build16
           path: |
-            Waypoint-1.0.5-port60142-build15.ipa
-            Waypoint-1.0.5-port60142-source.tar.gz
+            Waypoint-1.0.5-build16.ipa
+            Waypoint-1.0.5-build16-source.tar.gz
             waypoint-port.patch
             SHA256SUMS
             native-SHA256SUMS
